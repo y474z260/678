@@ -7,51 +7,35 @@
 
 #include "libscheduler.h"
 #include "../libpriqueue/libpriqueue.h"
-#define SIZE 50
-int Wtime[SIZE];
-int Rtime[SIZE];
-int TAtime[SIZE];
-int core_count;
-scheme_t schemeUsed;
+float waiting, turnaround, respons;
 
-priqueue_t* queues;
 
 /**
   Stores information making up a job to be scheduled including any statistics.
 
   You may need to define some global variables or a struct to store your job queue elements. 
 */
-typedef struct _job_t
-{
-    int jobnum;
-    int arriv_time;
-    int run_time;
-    int executed_time;
-    int priority;
-    int coreUsed;
+scheduler_t* sched;
+int jobdown;
 
-} job_t;
 
-int compare_FCFS(const void* p1, const void* p2)
+int compare_FCFS()
 {
-    int p1_arrv = ((job_t*)p1)->arriv_time;
-    int p2_arrv = ((job_t*)p2)->arriv_time;
-    
-    return p1_arrv - p2_arrv;
+    return 0;
 }
 
 int compare_SJF(const void* p1, const void* p2)
 {
-    int p1_runtime = ((job_t*)p1)->run_time;
-    int p2_runtime = ((job_t*)p2)->run_time;
+    int p1_runtime = ((job_t*)p1)->timeleft;
+    int p2_runtime = ((job_t*)p2)->timeleft;
     
     return p1_runtime - p2_runtime;
 }
 
 int compare_PSJF(const void* p1, const void* p2)
 {
-    int p1_remaintime = ((job_t*)p1)->run_time - ((job_t*)p1)->executed_time;
-    int p2_remaintime = ((job_t*)p2)->run_time - ((job_t*)p2)->executed_time;
+    int p1_remaintime = ((job_t*)p1)->timeleft;
+    int p2_remaintime = ((job_t*)p2)->timeleft;
     
     return p1_remaintime - p2_remaintime;
 }
@@ -66,12 +50,55 @@ int compare_PRI(const void* p1, const void* p2)
 
 int compare_PPRI(const void* p1, const void* p2)
 {
+    int p1_pri = ((job_t*)p1)->priority;
+    int p2_pri = ((job_t*)p2)->priority;
     
+    return p1_pri - p2_pri; 
 }
 
-int compare_RR(const void* p1, const void* p2)
+
+void coreUpdata(int t)
 {
-    
+    for(int i = 0; i<sched->core_count; i++){
+        if(sched->core_status[i] != NULL){
+            sched->core_status[i]->timeleft -= (t - sched->core_status[i]->timerenew);
+            sched->core_status[i]->timerenew = t;
+        }
+    }
+}
+
+int preempt(job_t* currentjob, job_t* newjob, scheme_t scheme)
+{
+    int diff = -1;
+    if(scheme == PSJF){
+        diff = currentjob->timeleft - newjob->timeleft;
+        if(diff < 0){
+            return 0;
+        }
+        if(diff > 0){
+            return 1;
+        }
+        return currentjob->arriv_time > newjob->arriv_time;
+    }
+    if(scheme == PPRI){
+        diff = currentjob->priority - newjob->priority;
+        if(diff < 0){
+            return 0;
+        }
+        if(diff > 0){
+            return 1;
+        }
+        return currentjob->arriv_time > newjob->arriv_time;
+    }
+    return diff;
+}
+
+void record(job_t* job, int t)
+{
+    waiting = (waiting*(float)jobdown + (float)(job->wait))/((float)jobdown + 1.0f);
+    turnaround = (turnaround*(float)jobdown + (float)t - (float)(job->arriv_time))/((float)jobdown + 1.0f);
+    respons = (respons*(float)jobdown + (float)(job->responded))/((float)jobdown + 1.0f);
+    jobdown++;
 }
 /**
   Initalizes the scheduler.
@@ -87,40 +114,46 @@ int compare_RR(const void* p1, const void* p2)
 */
 void scheduler_start_up(int cores, scheme_t scheme)
 {
-    core_count = cores;
+    sched = malloc(sizeof(scheduler_t));
+    sched->scheme = scheme;
     
-    queues = (priqueue_t*) malloc (sizeof(priqueue_t)*cores);
-    for(int i = 0; i < cores; i++)
-    {
         switch(scheme)
         {
             case FCFS:
-                priqueue_init(queues[i], compare_FCFS);
+                priqueue_init(&sched->queues, &compare_FCFS);
                 break;
             
             case SJF:
-                priqueue_init(queues[i], compare_SJF);
+                priqueue_init(&sched->queues, &compare_SJF);
                 break;
                 
             case PSJF:
-                priqueue_init(queues[i], compare_PSJF);
+                priqueue_init(&sched->queues, &compare_PSJF);
                 break;
                 
             case PRI:
-                priqueue_init(queues[i], compare_PRI);
+                priqueue_init(&sched->queues, &compare_PRI);
                 break;
                 
             case PPRI:
-                priqueue_init(queues[i], compare_PPRI);
+                priqueue_init(&sched->queues, &compare_PPRI);
                 break;
                 
             case RR:
-                priqueue_init(queues[i], compare_RR);
+                priqueue_init(&sched->queues, &compare_FCFS);
                 break;
                     
             default:
                 break;
         }
+    sched->core_count = cores;
+    sched->core_status = malloc(sizeof(job_t*)*(sched->core_count));
+    for(int i=0; i<cores; i++){
+        sched->core_status[i] = NULL;
+        jobdown = 0;
+        waiting = 0;
+        turnaround = 0; 
+        respons = 0;
     }
     
 }
@@ -148,7 +181,7 @@ void scheduler_start_up(int cores, scheme_t scheme)
  */
 int scheduler_new_job(int job_number, int time, int running_time, int priority)
 {
-    job_t* job;
+    job_t* job = malloc(sizeof(job_t));
     
     int index;
     
@@ -156,16 +189,49 @@ int scheduler_new_job(int job_number, int time, int running_time, int priority)
     
     job->arriv_time = time;
     
-    job->run_time = running_time;
+    job->timeleft = running_time;
     
     job->priority = priority;
     
-    if(priqueue_size(queues) == o){
-        index = priqueue_offer(queues[0],job);
-        return index;
-    }else if(priqueue_size(queues) == core_count){
-        
+    job->responded = -1;
+    
+    job->wait = 0;
+    
+    job->timerenew = time;
+    
+    job->respondedto = -1;
+    coreUpdata(time);
+    for(int i=0; i<sched->core_count; i++){
+        if(sched->core_status[i] == NULL){
+            job->responded = 0;
+            job->respondedto = time;
+            sched->core_status[i] = job;
+            return i;
+        }
     }
+    if(sched->scheme == PPRI || sched->scheme == PPRI){
+        int preempted = -1;
+        for(int i=0; i<sched->core_count; i++){
+            if(preempt(sched->core_status[i], job, sched->scheme)){
+                if(preempted == -1 || preempt(sched->core_status[i], sched->core_status[preempted], sched->scheme))
+                    preempted = i;
+            }
+                
+            }
+        
+        if(preempted != 1){
+            if(sched->core_status[preempted]->respondedto == time){
+                sched->core_status[preempted]->respondedto = -1;
+                sched->core_status[preempted]->responded = -1;
+            }
+            priqueue_offer(&sched->queues, sched->core_status[preempted]);
+            sched->core_status[preempted] = job;
+            job->responded = 0;
+            job->respondedto = time;
+            return preempted;
+        }
+    }
+    priqueue_offer(&sched->queues, job);
 	return -1;
 }
 
@@ -184,8 +250,22 @@ int scheduler_new_job(int job_number, int time, int running_time, int priority)
   @return job_number of the job that should be scheduled to run on core core_id
   @return -1 if core should remain idle.
  */
-int scheduler_job_finished(int core_id, int job_number, int time)
+int scheduler_job_finished(int core_id, int time)
 {
+    coreUpdata(time);
+    record(sched->core_status[core_id], time);
+    free(sched->core_status[core_id]);
+    if(priqueue_size(&sched->queues)!=0){
+        sched->core_status[core_id] = priqueue_poll(&sched->queues);
+        sched->core_status[core_id]->wait += (time-sched->core_status[core_id]->timerenew);
+        if(sched->core_status[core_id]->responded == -1){
+            sched->core_status[core_id]->responded = (time-sched->core_status[core_id]->arriv_time);
+            sched->core_status[core_id]->respondedto = time;
+        }
+        sched->core_status[core_id]->timerenew = time;
+        return sched->core_status[core_id]->jobnum;
+    }
+    sched->core_status[core_id] = NULL;
 	return -1;
 }
 
@@ -205,6 +285,27 @@ int scheduler_job_finished(int core_id, int job_number, int time)
  */
 int scheduler_quantum_expired(int core_id, int time)
 {
+    sched->core_status[core_id]->timeleft -= time-sched->core_status[core_id]->timerenew;
+    sched->core_status[core_id]->timerenew = time;
+    if(sched->core_status[core_id]->timeleft <= 0){
+        record(sched->core_status[core_id], time);
+        free(sched->core_status[core_id]);
+        sched->core_status[core_id] = NULL;
+    }else{
+        priqueue_offer(&sched->queues, sched->core_status[core_id]);
+        sched->core_status[core_id] = NULL;
+    }
+    if(priqueue_size(&sched->queues)!=0){
+        job_t* job2 = priqueue_poll(&sched->queues);
+        job2->wait += time-job2->timerenew;
+        if(job2->responded == -1){
+            job2->responded = time-job2->arriv_time;
+            job2->respondedto = time;
+        }
+        job2->timerenew = time;
+        sched->core_status[core_id] = job2;
+        return job2->jobnum;
+    }
 	return -1;
 }
 
@@ -218,7 +319,7 @@ int scheduler_quantum_expired(int core_id, int time)
  */
 float scheduler_average_waiting_time()
 {
-	return 0.0;
+	return waiting;
 }
 
 
@@ -231,7 +332,7 @@ float scheduler_average_waiting_time()
  */
 float scheduler_average_turnaround_time()
 {
-	return 0.0;
+	return turnaround;
 }
 
 
@@ -244,7 +345,7 @@ float scheduler_average_turnaround_time()
  */
 float scheduler_average_response_time()
 {
-	return 0.0;
+	return respons;
 }
 
 
@@ -256,7 +357,9 @@ float scheduler_average_response_time()
 */
 void scheduler_clean_up()
 {
-
+    priqueue_destroy(&sched->queues);
+    free(sched->core_status);
+    free(sched);
 }
 
 
@@ -273,5 +376,14 @@ void scheduler_clean_up()
  */
 void scheduler_show_queue()
 {
-
+    priqueue_node_t* node = sched->queues.root;
+    for(int i=0; i<sched->queues.size; i++){
+        if(sched->scheme == PRI || sched->scheme == PPRI){
+            printf("%d(priority%d)", ((job_t*)(node->content))->jobnum, ((job_t*)(node->content))->priority);
+            
+        }else{
+            printf("%d(timeleft%d)", ((job_t*)(node->content))->jobnum, ((job_t*)(node->content))->timeleft);
+            node = node->next;
+        }
+    }
 }
